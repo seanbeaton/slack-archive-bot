@@ -214,6 +214,8 @@ def handle_query(event):
         user = None
         channel = None
         sort = None
+        end_date = None
+        start_date = None
         limit = default_results_limit
 
         params = event['text'].lower().split()
@@ -247,6 +249,16 @@ def handle_query(event):
                         limit = int(p[1])
                     except:
                         raise ValueError('%s not a valid number' % p[1])
+                if p[0] == 'start':
+                    try:
+                        start_date = datetime.datetime.strptime(p[1], '%Y-%m-%d')
+                    except:
+                        raise ValueError('%s not a valid start date. Please use ISO format YYYY-MM-DD.' % p[1])
+                if p[0] == 'end':
+                    try:
+                        end_date = datetime.datetime.strptime(p[1], '%Y-%m-%d')
+                    except:
+                        raise ValueError('%s not a valid end date. Please use ISO format YYYY-MM-DD.' % p[1])
                 else:
                     raise ValueError('%s:%s is not a valid option for this command' % (p[0], [1]))
 
@@ -259,6 +271,13 @@ def handle_query(event):
         if channel:
             query += ' AND channel=(?)'
             query_args.append(channel)
+        if start_date:
+            query += ' AND timestamp > (?)'
+            query_args.append(start_date)
+        if end_date:
+            query += ' AND timestamp < (?)'
+            query_args.append(end_date)
+
         if sort:
             query += ' ORDER BY timestamp %s' % sort
             #query_args.append(sort)
@@ -413,20 +432,11 @@ def handle_more_query(event):
 
 
             if len(p) == 2:
-                if p[0] == 'from':
-                    user = get_user_id(p[1].replace('@','').strip())
-                    if user is None:
-                        raise ValueError('User %s not found' % p[1])
                 if p[0] == 'sort':
                     if p[1] in ['asc', 'desc']:
                         sort = p[1]
                     else:
                         raise ValueError('Invalid sort order %s' % p[1])
-                # if p[0] == 'limit':
-                #     try:
-                #         limit = int(p[1])
-                #     except:
-                #         raise ValueError('%s not a valid number' % p[1])
                 if p[0] == 'start':
                     try:
                         start_date = datetime.datetime.strptime(p[1], '%Y-%m-%d')
@@ -569,8 +579,9 @@ def handle_more_query(event):
                 }
                 for idx, i in enumerate(res) if can_query_channel(i[3], event['user'])
             }
-            res_message = '\n\n\n'.join(['[%s] %s (@%s, %s, %s, %s)' % (
-                idx, i['message'], i['formatted_user'], i['formatted_time'], i['formatted_channel'], i['hash'][:8]
+            res_message = '\n\n\n'.join(['%s %s (@%s, %s, %s, %s)' % (
+                '**' if i['hash'] == ref_message['hash'] else '',
+                i['message'], i['formatted_user'], i['formatted_time'], i['formatted_channel'], i['hash'][:8]
             ) for idx, i in results.items()])
         if res_message:
             send_message(res_message, event['channel'])
@@ -580,6 +591,55 @@ def handle_more_query(event):
         logger.error(traceback.format_exc())
         send_message(str(e), event['channel'])
 
+
+def handle_help(event):
+    send_message("""
+    Available commands:\n
+    \n> *Search*
+    Searches the database of messages. Lists author, time, channel, along with a index that can be used to view surrounding messages. See the `!more` command.
+    <search term> [options]
+    Example:
+    `friday meeting channel:general`
+    
+    \n> *Context around a search result* `!more`
+    !more <id> [-<number of messages before or time period before> [+<number of messages after or time period after>]]
+    Shows 10 messages before and 3 messages after the 2nd result from your most recent search.
+    
+    `-X` shows X messages before the selected one.     
+    `+X` shows X messages after the selected one.     
+    `+3m` shows messages sent within 3 minutes of the selected one.
+    Allowed time periods are:
+    Minutes: `m`, `minute`, or `minutes`
+    Hours: `h`, `hour`, or `hours`
+    Days: `d`, `day`, or `days`
+    Weeks: `w`, `week`, or `weeks`
+    
+    Example:
+    `!more 2 -3 +10m`: Shows 3 messages before the selected one, plus all messages sent in that channel for the following 10 minutes.
+    
+    \n> *Help* `!help`
+    Shows this dialog
+    
+    \n> *Available options*:
+    
+    `from:<username>`: Shows messages from a user. For example: `from:john`
+    Works for `search`
+    
+    `in:<channel>`: Shows messages from a channel. For example: `in:general`
+    Works for `search`
+    
+    `limit:<num>`: Shows at most X messages. Defaults to %s. For example: `limit:10`
+    Works for `search`
+    
+    `sort:<order>`: Orders the messages by date, ascending or descending. Defaults to ascending. Allowed values are `asc` and `desc`. For example: `sort:desc`
+    Works for `!more`, `search`
+    
+    `start:YYYY-MM-DD`: Shows results _after_ a given date. Date must be in ISO format (YYYY-MM-DD). For example: `start:2019-01-23`
+    Works for `!more`, `search`
+    
+    `end:YYYY-MM-DD`: Shows results _before_ a given date. Date must be in ISO format (YYYY-MM-DD). For example: `end:2019-11-23`
+    Works for `!more`, `search`
+    """ % default_results_limit, event['channel'])
 
 def handle_message(event):
     if 'text' not in event:
@@ -591,7 +651,9 @@ def handle_message(event):
 
     # If it's a DM, treat it as a search query
     if event['channel'][0] == 'D':
-        if event['text'][0:5] == '!more':
+        if event['text'][0:5] == '!help':
+            handle_help(event)
+        elif event['text'][0:5] == '!more':
             handle_more_query(event)
         else:
             handle_query(event)
