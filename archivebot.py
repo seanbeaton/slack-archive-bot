@@ -5,10 +5,16 @@ import os
 import sqlite3
 import time
 import traceback
+import json
+import re
+import hashlib
 
 from slackclient import SlackClient
 from websocket import WebSocketConnectionClosedException
 
+default_messages_before = 5
+default_messages_after = 5
+default_results_limit = 10
 
 
 parser = argparse.ArgumentParser()
@@ -28,9 +34,10 @@ database_path = args.database_path
 # Connects to the previously created SQL database
 conn = sqlite3.connect(database_path)
 cursor = conn.cursor()
-cursor.execute('create table if not exists messages (message text, user text, channel text, timestamp text, UNIQUE(channel, timestamp) ON CONFLICT REPLACE)')
+cursor.execute('create table if not exists messages (message text, user text, channel text, timestamp text, hash text, UNIQUE(channel, timestamp) ON CONFLICT REPLACE)')
 cursor.execute('create table if not exists users (name text, id text, avatar text, UNIQUE(id) ON CONFLICT REPLACE)')
 cursor.execute('create table if not exists channels (name text, id text, UNIQUE(id) ON CONFLICT REPLACE)')
+cursor.execute('create table if not exists searches (query text, user text, results text, timestamp text, UNIQUE(user, timestamp) ON CONFLICT REPLACE)')
 
 # This token is given when the bot is started in terminal
 slack_token = os.environ["SLACK_API_TOKEN"]
@@ -48,6 +55,23 @@ ENV = {
     'id_channel': {},
     'channel_info': {}
 }
+
+def update_database():
+    try:
+        cursor.execute('ALTER TABLE messages ADD COLUMN hash text;')
+        conn.commit()
+        # column didn't exist, populate column
+    except:
+        # column already exists
+        pass
+    finally:
+        logger.debug('Creating hashes of messages')
+        cursor.execute('SELECT user, timestamp FROM messages WHERE hash is NULL')
+        for row in cursor.fetchall():
+            cursor.execute('UPDATE messages SET hash = (?) WHERE user = (?) and timestamp = (?)', (get_event_hash({'user': row[0], 'ts': row[1]}), row[0], row[1]))
+        conn.commit()
+        logger.debug("Done creating hashes of messages")
+
 
 # Uses slack API to get most recent user list
 # Necessary for User ID correlation
@@ -77,6 +101,38 @@ def get_user_id(name):
         update_users()
     return ENV['user_id'].get(name, None)
 
+
+def parse_time_to_minutes(string):
+    """
+    Parses time from the user to a number of minutes. Potential inputs include:
+    1minute
+    2hours
+    15days
+    3weeks
+    :param string:
+    :return:
+    """
+    multipliers = {
+        'w': 7 * 24 * 60,
+        'week': 7 * 24 * 60,
+        'weeks': 7 * 24 * 60,
+        'd': 24 * 60,
+        'day': 24 * 60,
+        'days': 24 * 60,
+        'h': 60,
+        'hour': 60,
+        'hours': 60,
+        'm': 1,
+        'minute': 1,
+        'minutes': 1,
+    }
+
+    res = re.search('^(?P<quantity>[\d]+)(?P<unit>[a-zA-Z]+)$', string)
+    if not res or not res['quantity'] or not res['unit']:
+        raise ValueError('Unable to parse amount of time `%s`' % string)
+    if res['unit'] not in multipliers:
+        raise ValueError('`%s` is not a valid unit of time. Use /help to see valid options.' % res['unit'])
+    return multipliers[res['unit']] * float(res['quantity'])
 
 def update_channels():
     logger.info("Updating channels")
@@ -108,6 +164,15 @@ def get_channel_id(name):
     if name not in ENV['channel_id']:
         update_channels()
     return ENV['channel_id'].get(name, None)
+
+
+def get_event_hash(event):
+    user = event['user']
+    ts = event['ts'] if 'ts' in event else event['timestamp']
+    h = hashlib.sha256()
+    h.update(str(user + ts).encode('utf-8'))
+    return h.hexdigest()
+
 
 def send_message(message, channel):
     sc.api_call(
@@ -149,7 +214,7 @@ def handle_query(event):
         user = None
         channel = None
         sort = None
-        limit = 10
+        limit = default_results_limit
 
         params = event['text'].lower().split()
         for p in params:
@@ -182,8 +247,10 @@ def handle_query(event):
                         limit = int(p[1])
                     except:
                         raise ValueError('%s not a valid number' % p[1])
+                else:
+                    raise ValueError('%s:%s is not a valid option for this command' % (p[0], [1]))
 
-        query = 'SELECT message,user,timestamp,channel FROM messages WHERE message LIKE (?)'
+        query = 'SELECT message,user,timestamp,channel,hash FROM messages WHERE message LIKE (?)'
         query_args=["%"+" ".join(text)+"%"]
 
         if user:
@@ -203,13 +270,308 @@ def handle_query(event):
 
         res = cursor.fetchmany(limit)
         res_message=None
+        results=None
         if res:
             logger.debug(res)
-            res_message = '\n'.join(
-                ['%s (@%s, %s, %s)' % (
-                    i[0], get_user_name(i[1]), convert_timestamp(i[2]), '#'+get_channel_name(i[3])
-                ) for i in res if can_query_channel(i[3], event['user'])]
+            results = {
+                str(idx + 1): {
+                    'message': i[0],
+                    'user': i[1],
+                    'formatted_user': get_user_name(i[1]),
+                    'time': i[2],
+                    'formatted_time': convert_timestamp(i[2]),
+                    'channel': i[3],
+                    'formatted_channel': '#' + get_channel_name(i[3]),
+                    'hash': i[4],
+                }
+                for idx, i in enumerate(res) if can_query_channel(i[3], event['user'])
+            }
+            res_message = '\n\n\n'.join(['[%s] %s (@%s, %s, %s, %s)' % (
+                idx, i['message'], i['formatted_user'], i['formatted_time'], i['formatted_channel'], i['hash'][:8]
+            ) for idx, i in results.items()])
+        if res_message:
+            send_message(res_message, event['channel'])
+        else:
+            send_message('No results found', event['channel'])
+        save_user_query(event, results)
+
+    except ValueError as e:
+        logger.error(traceback.format_exc())
+        send_message(str(e), event['channel'])
+
+
+def save_user_query(event, results):
+    """
+    Saves a user query so we can refer back to it if they ask for more info. Stores the results so we know what they
+    mean when they give us an index.
+    """
+
+    if results:
+        cursor.execute('INSERT INTO searches(query, user, results, timestamp) VALUES(?, ?, ?, ?)',
+                       (event['text'], event['user'], json.dumps(results), event['ts'])
+                       )
+        conn.commit()
+
+def get_previous_user_query(user):
+    """
+    Saves a user query so we can refer back to it if they ask for more info. Stores the results so we know what they
+    mean when they give us an index.
+    """
+    logger.debug(user)
+    cursor.execute('SELECT user, results FROM searches WHERE user = (?) ORDER BY timestamp DESC LIMIT 1', (user, ))
+    res = cursor.fetchone()
+    return {
+        'user': res[0],
+        'results': json.loads(res[1]) if res[1] else {},
+    }
+
+
+def handle_more_query(event):
+    """
+    Handles a DM to the bot that is requesting context around a message from a previous search.
+
+    Usage:
+
+        <query> from:<user> in:<channel> sort:asc|desc limit:<number>
+
+        query: The text to search for.
+        user: If you want to limit the search to one user, the username.
+        channel: If you want to limit the search to one channel, the channel name.
+        sort: Either asc if you want to search starting with the oldest messages,
+            or desc if you want to start from the newest. Default asc.
+        limit: The number of responses to return. Default 10.
+    """
+    try:
+        text = []
+        user = None
+        channel = None
+        sort = None
+        start_date = None
+        end_date = None
+        before_num_messages = default_messages_before
+        after_num_messages = default_messages_after
+        before_time_minutes_limit = None
+        after_time_minutes_limit = None
+        message_hash = None
+        # limit = default_messages_limit
+
+        matches = re.search(
+            r'!more (?P<index>([\d]+\b|[a-fA-F0-9-]{6,}))( \+(?P<after>[\d.]+[a-zA-Z]*)| -(?P<before>[\d.]+[a-zA-Z]*))*',
+            event['text'])
+        if not matches:
+            raise ValueError(
+                'Invalid query. Query format is `!more <id> [-<number of messages before or time period before> [+<number of messages after or time period after>]]`. \n Other commands to filter the results are also available. Type `!help` to see all options.')
+        else:
+            if matches['index']:
+                if len(matches['index']) >= 6:
+                    message_hash = matches['index']
+                else:
+                    try:
+                        # indexes are strings as it was stored in json in the db,
+                        # but we want to know if it's an index from the previous search or a hash.
+                        message_index = str(int(matches['index'], 10))
+                    except:
+                        raise ValueError(
+                            'Message id must be either the message hash (min 6 charaters), or an index from your previous search.')
+                    prev_search = get_previous_user_query(event['user'])
+                    prev_results = prev_search['results']
+                    logger.debug(('prev_results', prev_results))
+                    if message_index not in prev_results:
+                        raise ValueError(
+                            "Could not find message index %s in your previous search's results." % message_index)
+                    message_hash = prev_results[message_index]['hash']
+            else:
+                raise ValueError('No message id provided')
+
+            if matches['after']:
+                try:
+                    after_num_messages = int(matches['after'], 10)
+                except:
+                    # isn't # of messages
+                    after_time_minutes_limit = parse_time_to_minutes(matches['after'])
+                    after_num_messages = None
+            if matches['before']:
+                try:
+                    before_num_messages = int(matches['before'], 10)
+                except:
+                    # isn't # of messages
+                    before_time_minutes_limit = parse_time_to_minutes(matches['before'])
+                    before_num_messages = None
+
+        params = event['text'].lower().split()
+        for p in params:
+            # Handle emoji
+            # usual format is " :smiley_face: "
+            if len(p) > 2 and p[0] == ':' and p[-1] == ':':
+                text.append(p)
+                continue
+
+            p = p.split(':')
+
+            if len(p) == 1:
+                pass
+
+
+            if len(p) == 2:
+                if p[0] == 'from':
+                    user = get_user_id(p[1].replace('@','').strip())
+                    if user is None:
+                        raise ValueError('User %s not found' % p[1])
+                if p[0] == 'sort':
+                    if p[1] in ['asc', 'desc']:
+                        sort = p[1]
+                    else:
+                        raise ValueError('Invalid sort order %s' % p[1])
+                # if p[0] == 'limit':
+                #     try:
+                #         limit = int(p[1])
+                #     except:
+                #         raise ValueError('%s not a valid number' % p[1])
+                if p[0] == 'start':
+                    try:
+                        start_date = datetime.datetime.strptime(p[1], '%Y-%m-%d')
+                    except:
+                        raise ValueError('%s not a valid start date. Please use ISO format YYYY-MM-DD.' % p[1])
+                if p[0] == 'end':
+                    try:
+                        end_date = datetime.datetime.strptime(p[1], '%Y-%m-%d')
+                    except:
+                        raise ValueError('%s not a valid end date. Please use ISO format YYYY-MM-DD.' % p[1])
+                else:
+                    raise ValueError('%s:%s is not a valid option for this command' % (p[0], [1]))
+
+        if not message_hash:
+            raise ValueError('Message `%s` not found' % message_hash)
+
+        reference_message_query = "SELECT timestamp, hash, channel FROM messages where HASH like (?)"
+        cursor.execute(reference_message_query, (message_hash + '%', ))
+        reference_message_result = cursor.fetchone()
+
+        if not reference_message_result:
+            raise ValueError('Message `%s` not found in search' % message_hash)
+
+        ref_message = {
+            'timestamp': reference_message_result[0],
+            'hash': reference_message_result[1],
+            'channel': reference_message_result[2],
+        }
+
+        query = 'SELECT message,user,timestamp,channel,hash FROM messages m WHERE 1=1'
+        query_args=[]
+
+        query += " AND channel=(?)"
+        query_args.append(ref_message['channel'])
+        if user:
+            query += ' AND user=(?)'
+            query_args.append(user)
+        if start_date:
+            query += ' AND timestamp > (?)'
+            query_args.append(start_date)
+        if end_date:
+            query += ' AND timestamp < (?)'
+            query_args.append(end_date)
+
+        # if we have the before or after, use the query to restrict.
+        # we also create a backup query that will include all items
+        # before/after (depends which one) that way this can be
+        # mixed-and-matched with the date version. It's only used if
+        # the before_after_sql is.
+        before_after_sql = []
+
+        backup_before_after = []
+        backup_before_after_query_args = []
+
+        if before_num_messages:
+            before_after_sql += [""" 
+            hash in (
+                SELECT mb.hash 
+                FROM messages mb
+                WHERE (mb.timestamp - (?)) > 0
+                AND mb.hash <> (?)
+                ORDER BY mb.timestamp desc
+                LIMIT (?)
             )
+            """]
+            query_args.append(ref_message['timestamp'])
+            query_args.append(ref_message['hash'])
+            query_args.append(before_num_messages)
+        else:
+            backup_before_after += ['timestamp < (?)']
+            backup_before_after_query_args.append(ref_message['timestamp'])
+
+
+        if after_num_messages:
+            # message time minus ref time is positive - message after ref
+            # message time minus ref time is negative - message before ref
+            # message asc - early message first
+            # message desc - last message first
+            before_after_sql += [""" 
+            hash in (
+                SELECT mb.hash 
+                FROM messages mb
+                WHERE (mb.timestamp - (?)) > 0
+                AND mb.hash <> (?)
+                ORDER BY mb.timestamp asc
+                LIMIT (?)
+            )
+            """]
+            query_args.append(ref_message['timestamp'])
+            query_args.append(ref_message['hash'])
+            query_args.append(after_num_messages)
+        else:
+            backup_before_after += ['timestamp > (?)']
+            backup_before_after_query_args.append(ref_message['timestamp'])
+
+        if before_after_sql:
+            # include the reference message if we're doing before/after
+            before_after_sql += ["hash = (?)"]
+            query_args.append(ref_message['hash'])
+
+            if backup_before_after:
+                # use the backup if we have it. it only exists when we set one but not the other.
+                before_after_sql += backup_before_after
+                query_args += backup_before_after_query_args
+
+            query += ' AND (' + " OR ".join(before_after_sql) + ')'
+
+
+        if before_time_minutes_limit:
+            query += ' AND timestamp > (?)'
+            query_args.append(str(float(ref_message['timestamp']) - float(before_time_minutes_limit * 60)))
+
+        if after_time_minutes_limit:
+            query += ' AND timestamp < (?)'
+            query_args.append(str(float(ref_message['timestamp']) + float(after_time_minutes_limit * 60)))
+
+        if sort:
+            query += ' ORDER BY timestamp %s' % sort
+            #query_args.append(sort)
+
+        logger.debug(query)
+        logger.debug(query_args)
+
+        cursor.execute(query,query_args)
+
+        res = cursor.fetchall()
+        res_message=None
+        if res:
+            logger.debug(res)
+            results = {
+                str(idx + 1): {
+                    'message': i[0],
+                    'user': i[1],
+                    'formatted_user': get_user_name(i[1]),
+                    'time': i[2],
+                    'formatted_time': convert_timestamp(i[2]),
+                    'channel': i[3],
+                    'formatted_channel': '#' + get_channel_name(i[3]),
+                    'hash': i[4],
+                }
+                for idx, i in enumerate(res) if can_query_channel(i[3], event['user'])
+            }
+            res_message = '\n\n\n'.join(['[%s] %s (@%s, %s, %s, %s)' % (
+                idx, i['message'], i['formatted_user'], i['formatted_time'], i['formatted_channel'], i['hash'][:8]
+            ) for idx, i in results.items()])
         if res_message:
             send_message(res_message, event['channel'])
         else:
@@ -217,6 +579,7 @@ def handle_query(event):
     except ValueError as e:
         logger.error(traceback.format_exc())
         send_message(str(e), event['channel'])
+
 
 def handle_message(event):
     if 'text' not in event:
@@ -228,16 +591,21 @@ def handle_message(event):
 
     # If it's a DM, treat it as a search query
     if event['channel'][0] == 'D':
-        handle_query(event)
+        if event['text'][0:5] == '!more':
+            handle_more_query(event)
+        else:
+            handle_query(event)
     elif 'user' not in event:
         logger.warn("No valid user. Previous event not saved")
     else: # Otherwise save the message to the archive.
-        cursor.executemany('INSERT INTO messages VALUES(?, ?, ?, ?)',
-            [(event['text'], event['user'], event['channel'], event['ts'])]
+        cursor.executemany('INSERT INTO messages VALUES(?, ?, ?, ?, ?)',
+            [(event['text'], event['user'], event['channel'], event['ts'], get_event_hash(event))]
         )
         conn.commit()
 
     logger.debug("--------------------------")
+
+update_database()
 
 # Loop
 if sc.rtm_connect(auto_reconnect=True):
